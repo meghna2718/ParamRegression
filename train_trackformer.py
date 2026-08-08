@@ -423,12 +423,22 @@ class ParamLoss:
         return self.fn(preds, targets)
 
 
-def geometric_multi_task_loss(preds, targets, criteria, aggregate="geometric_mean", norm_loss="std"):
+def geometric_multi_task_loss(preds, targets, criteria, aggregate="geometric_mean", norm_loss="std", target_std=None):
     losses = []
     for i, crit in enumerate(criteria):
         p_i, t_i = preds[:, i], targets[:, i]
         if norm_loss == "std":
-            std = torch.std(t_i).clamp(min=1e-6)
+            # Fixed, precomputed per-parameter std (see main(): target_std is
+            # computed once from the full train pool). Previously this was
+            # recomputed per-batch via torch.std(t_i), which is both noisy
+            # (small/unlucky batches give an unstable normalization) and
+            # outright broken for a batch of size 1 -- torch.std() of a
+            # single element is NaN (n-1=0 denominator), and .clamp(min=...)
+            # does not fix NaN. That NaN then poisons the whole epoch's
+            # running loss sum. A DataLoader without drop_last=True (as used
+            # for validation) will hit a size-1 last batch whenever
+            # len(dataset) % batch_size == 1, exactly what happened here.
+            std = target_std[i] if target_std is not None else torch.std(t_i).clamp(min=1e-6)
             p_i, t_i = p_i / std, t_i / std
         losses.append(crit(p_i, t_i))
     losses = torch.stack(losses)
@@ -465,7 +475,7 @@ class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
 # 5. Train / eval
 # ============================================================================
 
-def run_epoch(model, loader, criteria, args, device, optimizer=None, scheduler=None):
+def run_epoch(model, loader, criteria, args, device, optimizer=None, scheduler=None, target_std=None):
     train = optimizer is not None
     model.train(train)
     total_loss, total_param_losses, n_batches = 0.0, np.zeros(len(criteria)), 0
@@ -475,7 +485,8 @@ def run_epoch(model, loader, criteria, args, device, optimizer=None, scheduler=N
             x, mask, y = x.to(device), mask.to(device), y.to(device)
             preds = model(x, mask)
             loss, param_losses = geometric_multi_task_loss(
-                preds, y, criteria, aggregate=args.aggregate_loss, norm_loss=args.norm_loss
+                preds, y, criteria, aggregate=args.aggregate_loss, norm_loss=args.norm_loss,
+                target_std=target_std,
             )
             if train:
                 optimizer.zero_grad()
@@ -580,9 +591,14 @@ def main():
     scaler = StandardScaler()
     targets_scaled_for_split_only = scaler.fit_transform(train_val_df[PARAM_NAMES].values)
     # NOTE: unlike the original notebooks, the model is trained directly on physical
-    # units (loss normalizes per-batch by label std, matching Jeremy's norm_loss="std"),
-    # so we keep the scaler only to save alongside artifacts / for reference.
+    # units (loss normalizes by a fixed per-parameter label std, matching Jeremy's
+    # norm_loss="std"), so we keep the scaler only to save alongside artifacts /
+    # for reference. scaler.scale_ (the per-parameter std over the full train
+    # pool) doubles as that fixed normalization constant below -- computed once
+    # here rather than per-batch, which used to be both statistically noisy and
+    # capable of producing NaN outright for degenerate (e.g. size-1) batches.
     joblib.dump(scaler, out_dir / "target_scaler.pkl")
+    target_std = torch.tensor(scaler.scale_, dtype=torch.float32, device=device).clamp(min=1e-6)
 
     targets = train_val_df[PARAM_NAMES].values.astype(np.float32)
     dataset = TrackDataset(
@@ -640,8 +656,10 @@ def main():
 
     for epoch in range(args.epochs):
         t_epoch = time.time()
-        tr_loss, tr_param = run_epoch(model, train_loader, criteria, args, device, optimizer, scheduler)
-        val_loss, val_param = run_epoch(model, val_loader, criteria, args, device)
+        tr_loss, tr_param = run_epoch(
+            model, train_loader, criteria, args, device, optimizer, scheduler, target_std=target_std
+        )
+        val_loss, val_param = run_epoch(model, val_loader, criteria, args, device, target_std=target_std)
         epoch_seconds = time.time() - t_epoch
 
         history["train_loss"].append(tr_loss)
@@ -669,10 +687,23 @@ def main():
     with open(out_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
     test_df.to_pickle(out_dir / "test_data.pkl")
-    print(
-        f"Best val loss: {best_val:.5f} at epoch {best_epoch+1}/{args.epochs} (saved to {best_path}) | "
-        f"training took {training_seconds/60:.1f} min ({training_seconds/args.epochs:.2f} s/epoch avg)"
-    )
+    if best_epoch == -1:
+        # val_loss was never a valid, finite number better than the initial
+        # +inf (e.g. every epoch's val loss came back NaN) -- model_best.pt
+        # was NEVER written, unlike what a generic "Best val loss: ..."
+        # message might imply. Surface this loudly instead of silently
+        # claiming a save that didn't happen.
+        print(
+            f"WARNING: val_loss was never finite/improving across all {args.epochs} epochs "
+            f"(best_val={best_val}) -- {best_path} was NOT created. Check training_history.json's "
+            f"val_param_loss for NaN/inf and fix the underlying data/loss issue before relying on "
+            f"downstream scripts (analyze_results.py etc.) that expect model_best.pt to exist."
+        )
+    else:
+        print(
+            f"Best val loss: {best_val:.5f} at epoch {best_epoch+1}/{args.epochs} (saved to {best_path}) | "
+            f"training took {training_seconds/60:.1f} min ({training_seconds/args.epochs:.2f} s/epoch avg)"
+        )
 
     # Timing/convergence summary -- read this before sizing up other runs.
     # best_epoch tells you how many epochs were actually needed for THIS
