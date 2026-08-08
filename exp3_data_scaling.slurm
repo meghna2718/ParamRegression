@@ -11,8 +11,8 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --array=0-5            # 6 dataset sizes, 1 seed each (add seeds if time allows)
 
-module load Python/3.9.6-GCCcore-11.2.0
-source /home/xucabm80/ParamRegression/trackformer_env/bin/activate
+eval "$(~/.local/bin/micromamba shell hook --shell bash)"
+micromamba activate paramreg_env
 
 cd /home/xucabm80/ParamRegression
 pip install -q -r requirements.txt   # one-time; harmless if already installed

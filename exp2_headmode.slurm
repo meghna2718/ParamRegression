@@ -18,8 +18,8 @@
 # already finished and produced runs/exp1_posenc_none_seed{0,1}/ before you
 # run the comparison step at the bottom of this file.
 
-module load Python/3.9.6-GCCcore-11.2.0
-source /home/xucabm80/ParamRegression/trackformer_env/bin/activate
+eval "$(~/.local/bin/micromamba shell hook --shell bash)"
+micromamba activate paramreg_env
 
 cd /home/xucabm80/ParamRegression
 pip install -q -r requirements.txt   # one-time; harmless if already installed
