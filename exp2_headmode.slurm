@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=150G
 #SBATCH --partition=GPU
 #SBATCH --gres=gpu:a100:1
 #SBATCH --array=0-1            # 2 seeds of "separate" only
@@ -30,9 +30,19 @@ pip install -q -r requirements.txt   # one-time; harmless if already installed
 SEEDS=(0 1)
 SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
-python train_trackformer.py \
+# To restrict training to muons only (|pdg_id|==13, both charge signs) --
+# matching Jeremy's actual single-muon training set instead of all primary
+# ttbar particle species -- set PARTICLE_TYPE_FLAG below to "--particle-types 13".
+# Currently empty = disabled (train on all primary species, current default).
+# NOTE: muons are a small fraction of particles per event, so --max-events
+# would need to go up substantially to still hit --train-events/--test-events
+# worth of muon tracks -- check the "[filters] |pdg_id| in ..." line in the
+# run's output to see the actual survival rate before committing to a full run.
+PARTICLE_TYPE_FLAG=""
+
+python -u train_trackformer.py \
     --channel ttbar --pileup pu200 \
-    --max-events 1700 --train-events 1500 --test-events 150 \
+    --max-events 950 --train-events 800 --test-events 100 \
     --features r dphi z \
     --d-model 128 --nhead 4 --num-layers 4 \
     --pos-encoding none \
@@ -40,6 +50,7 @@ python train_trackformer.py \
     --seed ${SEED} \
     --batch-size 128 --epochs 400 --lr 1e-3 \
     --eval-acts \
+    ${PARTICLE_TYPE_FLAG} \
     --out-dir runs/exp2_head_separate_seed${SEED}
 
 python analyze_results.py --run-dir runs/exp2_head_separate_seed${SEED}

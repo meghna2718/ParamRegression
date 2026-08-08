@@ -98,6 +98,22 @@ def load_colliderml(args):
     del frames
     gc.collect()
 
+    # Drop columns nothing in this pipeline ever reads (confirmed via a live
+    # check: raw particles_flat/hits_flat carry ~19/~14 columns respectively,
+    # e.g. mass, energy, vertex position, true_x/y/z, detector/volume/layer/
+    # surface ids -- none of which are used anywhere below). At pu200 scale
+    # (hundreds of millions of raw rows before any event/track filtering),
+    # keeping only what's needed noticeably cuts memory for everything that
+    # touches these tables downstream.
+    particles_keep = [
+        "event_id", "particle_id", "pdg_id", "charge",
+        "px", "py", "pz", "perigee_d0", "perigee_z0", "primary",
+    ]
+    hits_keep = ["event_id", "particle_id", "x", "y", "z"]
+    particles_flat = particles_flat[[c for c in particles_keep if c in particles_flat.columns]]
+    hits_flat = hits_flat[[c for c in hits_keep if c in hits_flat.columns]]
+    gc.collect()
+
     return particles_flat, hits_flat, train_event_ids, test_event_ids
 
 
@@ -150,53 +166,64 @@ def _track_scatter_metrics(dphi_seq):
 
 
 def build_dataset_frames(particles_flat, hits_flat, args):
-    hits_flat = engineer_features(hits_flat)
+    n_raw_particles, n_raw_hits = len(particles_flat), len(hits_flat)
+    print(f"[filters] Raw particles: {n_raw_particles:,} | Raw hits: {n_raw_hits:,}")
 
-    missing = [f for f in args.features if f not in hits_flat.columns]
-    if missing:
-        raise ValueError(f"Unknown feature(s) {missing}; available: {sorted(hits_flat.columns)}")
-
-    # Per-track scattering diagnostic (see _track_scatter_metrics docstring).
-    # hits_flat is already sorted by (event_id, particle_id, r) inside
-    # engineer_features, so groupby preserves radius order.
-    scatter_rows = [
-        {"event_id": eid, "particle_id": pid, **dict(zip(
-            ("scatter_n_kinks", "scatter_max_kink"), _track_scatter_metrics(g["dphi"].values)
-        ))}
-        for (eid, pid), g in hits_flat.groupby(["event_id", "particle_id"], sort=False)
-    ]
-    scatter_df = pd.DataFrame(scatter_rows)
-
-    hit_counts = hits_flat.groupby(["event_id", "particle_id"]).size().reset_index(name="calculated_hits")
-    raw_vals = hits_flat[args.features].values
-    split_indices = np.cumsum(hit_counts["calculated_hits"].values)[:-1]
-    seqs = np.split(raw_vals, split_indices)
-    hits_grouped = hit_counts[["event_id", "particle_id"]].copy()
-    hits_grouped["hits_sequence"] = seqs
-    del hits_flat, raw_vals
-    gc.collect()
+    # Per-particle hit count, computed on the FULL raw hits table -- this is
+    # just a groupby().size() (a single cheap hash-aggregation pass, no
+    # sorting or per-hit feature math), so it's fine to do this before any
+    # filtering. We need it now because --min-hits/--max-hits depend on it.
+    hit_counts_all = hits_flat.groupby(["event_id", "particle_id"]).size().reset_index(name="calculated_hits")
 
     for col in ["px", "py", "pz", "perigee_d0", "perigee_z0"]:
         particles_flat[col] = particles_flat[col].astype(np.float32)
-    particles_flat = particles_flat.merge(hit_counts, on=["event_id", "particle_id"], how="left")
+    particles_flat = particles_flat.merge(hit_counts_all, on=["event_id", "particle_id"], how="left")
     particles_flat["pt"] = np.sqrt(particles_flat["px"] ** 2 + particles_flat["py"] ** 2)
+    del hit_counts_all
 
-    mask_valid = (
-        (particles_flat.get("primary", True) == True)  # noqa: E712
-        & (particles_flat["pt"] > args.min_pt)
-        & (particles_flat["calculated_hits"].fillna(0) >= args.min_hits)
-        & (particles_flat["calculated_hits"].fillna(0) <= args.max_hits)
-    )
+    # Filters applied one at a time (rather than one combined boolean AND)
+    # purely so each cut's effect can be logged individually -- identical
+    # final result to the equivalent single combined mask, just with
+    # visibility into where tracks actually get lost. Useful both for
+    # sanity-checking filter choices and for reporting dataset provenance.
+    mask = particles_flat.get("primary", True) == True  # noqa: E712
+    if isinstance(mask, bool):  # no "primary" column at all -> vacuously true
+        mask = pd.Series(mask, index=particles_flat.index)
+    n = len(particles_flat)
+    n_after = int(mask.sum())
+    print(f"[filters] primary == True:        {n_after:>12,} particles  (-{n - n_after:,})")
+    n = n_after
+
+    mask &= particles_flat["pt"] > args.min_pt
+    n_after = int(mask.sum())
+    print(f"[filters] pt > {args.min_pt:<6g}          {n_after:>12,} particles  (-{n - n_after:,})")
+    n = n_after
+
+    mask &= particles_flat["calculated_hits"].fillna(0) >= args.min_hits
+    n_after = int(mask.sum())
+    print(f"[filters] hits >= {args.min_hits:<6}       {n_after:>12,} particles  (-{n - n_after:,})")
+    n = n_after
+
+    mask &= particles_flat["calculated_hits"].fillna(0) <= args.max_hits
+    n_after = int(mask.sum())
+    print(f"[filters] hits <= {args.max_hits:<6}       {n_after:>12,} particles  (-{n - n_after:,})")
+    n = n_after
+
     if args.particle_types:
         # e.g. --particle-types 13 to reproduce Jeremy's actual single-muon
         # training set (his queued .sub job used dataset_single_muons_...,
         # not the ttbar dataset yaml -- see chat). Compares |pdg_id| so both
         # charge signs of a species are included.
         allowed = set(abs(t) for t in args.particle_types)
-        mask_valid &= particles_flat["pdg_id"].abs().isin(allowed)
-    good = particles_flat[mask_valid].copy()
-    del particles_flat, mask_valid
+        mask &= particles_flat["pdg_id"].abs().isin(allowed)
+        n_after = int(mask.sum())
+        print(f"[filters] |pdg_id| in {sorted(allowed)}: {n_after:>12,} particles  (-{n - n_after:,})")
+        n = n_after
+
+    good = particles_flat[mask].copy()
+    del particles_flat, mask
     gc.collect()
+    print(f"[filters] Surviving particles (pre hit-level dropna): {len(good):,} / {n_raw_particles:,}")
 
     p = np.clip(np.sqrt(good["px"] ** 2 + good["py"] ** 2 + good["pz"] ** 2), 1e-7, None)
     good["d0"] = good["perigee_d0"]
@@ -206,11 +233,71 @@ def build_dataset_frames(particles_flat, hits_flat, args):
     good["eta"] = -np.log(np.tan(good["theta"] / 2.0))
     good["qop"] = good["charge"] / p
 
+    # Restrict hits to only the particles that survived the cuts above --
+    # BEFORE running the expensive per-hit feature engineering (sort_values +
+    # groupby.transform over the full hit table). In a pu200 event, the vast
+    # majority of hits belong to pileup particles the primary/pt/hit-count
+    # mask discards anyway (confirmed: 950 events loaded ~224M raw hit rows
+    # here, versus the low hundreds of thousands that actually survive these
+    # cuts). Doing the expensive per-hit math on ~everything first and
+    # throwing most of it away afterward -- the original ordering -- was
+    # almost certainly the dominant cost behind the multi-hour runtimes and
+    # OOM failures, well beyond the earlier scatter-metrics fix alone. This
+    # produces an IDENTICAL final result to filtering after feature
+    # engineering: engineer_features()'s per-hit math and the dphi
+    # computation only ever depend on a track's own hits, never on any other
+    # track's, so restricting to survivors first vs. last cannot change any
+    # surviving track's computed values -- it only skips computing values
+    # for tracks that get discarded either way.
+    hits_flat = hits_flat.merge(good[["event_id", "particle_id"]], on=["event_id", "particle_id"], how="inner")
+    print(f"[filters] Hits after restricting to surviving particles: {len(hits_flat):,} / {n_raw_hits:,}")
+    hits_flat = engineer_features(hits_flat)
+
+    missing = [f for f in args.features if f not in hits_flat.columns]
+    if missing:
+        raise ValueError(f"Unknown feature(s) {missing}; available: {sorted(hits_flat.columns)}")
+
+    # hit_counts/split_indices assume hits_flat is grouped in the SAME order
+    # groupby(sort=True) (the default) would produce -- true here because
+    # engineer_features() already sorted hits_flat by (event_id, particle_id, r),
+    # so consecutive rows for a given track are already contiguous and in
+    # ascending (event_id, particle_id) order, matching hit_counts' row order.
+    # (This recomputes counts on the now-filtered hits_flat; the values are
+    # identical to hit_counts_all restricted to survivors, since filtering
+    # only ever removes whole discarded particles, never individual hits
+    # belonging to a surviving one.)
+    hit_counts = hits_flat.groupby(["event_id", "particle_id"]).size().reset_index(name="calculated_hits")
+    split_indices = np.cumsum(hit_counts["calculated_hits"].values)[:-1]
+
+    raw_vals = hits_flat[args.features].values
+    seqs = np.split(raw_vals, split_indices)
+    hits_grouped = hit_counts[["event_id", "particle_id"]].copy()
+    hits_grouped["hits_sequence"] = seqs
+
+    # Per-track scattering diagnostic (see _track_scatter_metrics docstring).
+    # Reuses the same split_indices as hits_sequence above instead of a
+    # second full groupby pass building a Python dict per track.
+    dphi_seqs = np.split(hits_flat["dphi"].values, split_indices)
+    scatter_metrics = [_track_scatter_metrics(s) for s in dphi_seqs]
+    scatter_df = hits_grouped[["event_id", "particle_id"]].copy()
+    scatter_df["scatter_n_kinks"] = [m[0] for m in scatter_metrics]
+    scatter_df["scatter_max_kink"] = [m[1] for m in scatter_metrics]
+
+    del hits_flat, raw_vals, dphi_seqs, scatter_metrics
+    gc.collect()
+
     all_data = pd.merge(good, hits_grouped, on=["event_id", "particle_id"], how="inner")
     all_data = pd.merge(all_data, scatter_df, on=["event_id", "particle_id"], how="left")
+    n_before_dropna = len(all_data)
     all_data = all_data.dropna(subset=PARAM_NAMES).copy()
+    n_dropped = n_before_dropna - len(all_data)
+    if n_dropped:
+        print(f"[filters] Dropped {n_dropped:,} tracks with a NaN target ({sorted(PARAM_NAMES)}): "
+              f"{n_before_dropna:,} -> {len(all_data):,}")
     del good, hits_grouped
     gc.collect()
+    print(f"[filters] FINAL dataset: {len(all_data):,} tracks "
+          f"({len(all_data) / n_raw_particles:.2%} of {n_raw_particles:,} raw particles)")
     return all_data
 
 
