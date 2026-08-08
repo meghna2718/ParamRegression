@@ -173,15 +173,10 @@ def plot_ml_vs_acts(run_dir):
     names = [n for n in PARAM_NAMES if n in comp]
     ml_vals = [comp[n]["ml"] for n in names]
     acts_vals = [comp[n]["acts"] for n in names]
-    # Bootstrap 68% CIs -> symmetric-ish error bars around the point estimate
-    ml_err = [
-        [comp[n]["ml"] - comp[n]["ml_ci68"][0]], [comp[n]["ml_ci68"][1] - comp[n]["ml"]]
-    ] if all("ml_ci68" in comp[n] for n in names) else None
-    acts_err = [
-        [comp[n]["acts"] - comp[n]["acts_ci68"][0]], [comp[n]["acts_ci68"][1] - comp[n]["acts"]]
-    ] if all("acts_ci68" in comp[n] for n in names) else None
-    # reshape from per-name lists into [2, n] arrays for errorbar-style yerr
-    if ml_err is not None:
+    # Bootstrap 68% CIs -> symmetric-ish error bars around the point estimate,
+    # reshaped from per-name lists into [2, n] arrays for errorbar-style yerr.
+    has_ci = all("ml_ci68" in comp[n] and "acts_ci68" in comp[n] for n in names)
+    if has_ci:
         ml_yerr = np.array([[comp[n]["ml"] - comp[n]["ml_ci68"][0] for n in names],
                              [comp[n]["ml_ci68"][1] - comp[n]["ml"] for n in names]])
         acts_yerr = np.array([[comp[n]["acts"] - comp[n]["acts_ci68"][0] for n in names],
