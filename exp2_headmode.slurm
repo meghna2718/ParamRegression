@@ -2,7 +2,7 @@
 #SBATCH --job-name=TF_exp2_head
 #SBATCH --output=TF_exp2_head_%A_%a.out
 #SBATCH --error=TF_exp2_head_%A_%a.err
-#SBATCH --time=10:00:00
+#SBATCH --time=22:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

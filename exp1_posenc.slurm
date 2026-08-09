@@ -2,7 +2,7 @@
 #SBATCH --job-name=TF_exp1_posenc
 #SBATCH --output=TF_exp1_posenc_%A_%a.out
 #SBATCH --error=TF_exp1_posenc_%A_%a.err
-#SBATCH --time=10:00:00
+#SBATCH --time=22:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

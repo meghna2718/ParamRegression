@@ -162,6 +162,81 @@ def plot_feature_importance(importances, run_dir):
     print(f"Wrote {run_dir / 'plot_feature_importance.png'}")
 
 
+def plot_pred_vs_true(run_dir, test_df):
+    """2D density heatmap of ML prediction vs. ground truth, one panel per
+    parameter, using ALL test tracks (not just the ACTS-matched subset
+    comparison_df.pkl is restricted to -- more statistics, and doesn't
+    require --eval-acts). A raw scatter would overplot badly at this many
+    points, hence a density heatmap (hist2d) instead. The y=x reference line
+    makes systematic bias/scale issues (e.g. a mismatched sign or unit
+    convention) visually obvious in a way a single resolution number isn't --
+    useful for sanity-checking a surprisingly-good result before trusting it."""
+    fig, axes = plt.subplots(1, len(PARAM_NAMES), figsize=(4.3 * len(PARAM_NAMES), 4.3))
+    for ax, name in zip(axes, PARAM_NAMES):
+        truth = test_df[name].values
+        pred = test_df[f"ml_{name}"].values
+        lo, hi = np.percentile(np.concatenate([truth, pred]), [0.5, 99.5])
+        hb = ax.hist2d(truth, pred, bins=80, range=[[lo, hi], [lo, hi]], cmap="viridis", cmin=1)
+        ax.plot([lo, hi], [lo, hi], color="#ef4444", linestyle="--", linewidth=1.3, label="y = x (perfect)")
+        ax.set_xlabel(f"True {name}")
+        ax.set_ylabel(f"Predicted {name}")
+        ax.set_title(name)
+        ax.legend(fontsize=8, loc="upper left")
+        fig.colorbar(hb[3], ax=ax, label="tracks", shrink=0.85)
+    fig.suptitle(f"Predicted vs. true, all {len(test_df):,} test tracks", y=1.02)
+    fig.tight_layout()
+    fig.savefig(run_dir / "plot_pred_vs_true.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote {run_dir / 'plot_pred_vs_true.png'}")
+
+
+def plot_qop_sign_check(run_dir, test_df):
+    """Zoomed-in view of predicted vs. true qop near zero (i.e. near the
+    charge sign boundary, since sign(qop) == sign(charge)) plus the
+    misidentification rate broken out into narrow |true_qop| bins. If ML's
+    charge misID rate looks suspiciously good (e.g. 0%) in the headline
+    number, this is where a real sign-flip problem OR a genuine floor effect
+    would actually show up -- 0% averaged over all tracks can still hide a
+    real problem concentrated in the lowest-momentum tracks specifically."""
+    truth = test_df["qop"].values
+    pred = test_df["ml_qop"].values
+    misid = np.sign(pred) != np.sign(truth)
+    overall_misid_pct = 100 * misid.mean()
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    zoom = np.percentile(np.abs(truth), 15)  # zoom to the lowest-|qop| ~15% of tracks
+    m = np.abs(truth) <= zoom
+    axes[0].scatter(truth[m], pred[m], s=4, alpha=0.35, color=PALETTE["ml"])
+    axes[0].axhline(0, color="#334155", linewidth=1)
+    axes[0].axvline(0, color="#334155", linewidth=1)
+    axes[0].plot([-zoom, zoom], [-zoom, zoom], color="#ef4444", linestyle="--", linewidth=1.2, label="y = x")
+    axes[0].set_xlabel("True qop")
+    axes[0].set_ylabel("Predicted qop")
+    axes[0].set_title(f"Zoom near qop=0 (lowest {m.sum():,} |qop| tracks) -- sign flips would show as points\n"
+                       f"in the wrong (top-left / bottom-right) quadrants")
+    axes[0].legend(fontsize=8)
+
+    n_bins = 10
+    bin_edges = np.quantile(np.abs(truth), np.linspace(0, 1, n_bins + 1))
+    bin_idx = np.clip(np.digitize(np.abs(truth), bin_edges[1:-1]), 0, n_bins - 1)
+    misid_per_bin = [100 * misid[bin_idx == i].mean() if (bin_idx == i).any() else np.nan for i in range(n_bins)]
+    bin_centers = [(bin_edges[i] + bin_edges[i + 1]) / 2 for i in range(n_bins)]
+    bars = axes[1].bar(range(n_bins), misid_per_bin, color=PALETTE["ml"])
+    style_bars(bars)
+    axes[1].set_xticks(range(n_bins))
+    axes[1].set_xticklabels([f"{c:.3f}" for c in bin_centers], rotation=45, ha="right")
+    axes[1].set_xlabel("|true qop| (bin center, equal-count bins, low -> high momentum)")
+    axes[1].set_ylabel("Charge misID rate (%)")
+    axes[1].set_title(f"Overall: {overall_misid_pct:.3f}% ({int(misid.sum())}/{len(misid)} tracks)")
+
+    fig.tight_layout()
+    fig.savefig(run_dir / "plot_qop_sign_check.png", dpi=200)
+    plt.close(fig)
+    print(f"Wrote {run_dir / 'plot_qop_sign_check.png'} "
+          f"(overall charge misID: {overall_misid_pct:.3f}%, {int(misid.sum())}/{len(misid)} tracks)")
+
+
 def plot_ml_vs_acts(run_dir):
     path = run_dir / "acts_comparison.json"
     if not path.exists():
@@ -371,7 +446,18 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    plot_loss_curve(run_dir)
+    if (run_dir / "training_history.json").exists():
+        plot_loss_curve(run_dir)
+    else:
+        # Expected for a run evaluated via evaluate_checkpoint.py after being
+        # killed mid-training (e.g. a SLURM --time limit) BEFORE the
+        # checkpoint_latest.pt / --resume feature existed for it -- per-epoch
+        # history was never persisted for such a run, so there is genuinely
+        # nothing to plot here. Every other analysis below only needs the
+        # trained model + test set, not training history, so it still runs.
+        print("No training_history.json found -- skipping loss-curve plot "
+              "(expected for a run recovered via evaluate_checkpoint.py from "
+              "a run that never finished its training loop).")
     report_speed(run_dir)
 
     model, cfg = load_model(run_dir, device)
@@ -385,6 +471,14 @@ def main():
         print("\nFeature importance (higher = more important):")
         for name, val in sorted(importances.items(), key=lambda kv: kv[1], reverse=True):
             print(f"  {name:<12} {val:+.4f}")
+
+    preds_path = run_dir / "test_data_with_predictions.pkl"
+    if preds_path.exists():
+        test_preds_df = pd.read_pickle(preds_path)
+        plot_pred_vs_true(run_dir, test_preds_df)
+        plot_qop_sign_check(run_dir, test_preds_df)
+    else:
+        print(f"No {preds_path.name} found; skipping pred-vs-true heatmap and qop sign-check plots.")
 
     plot_ml_vs_acts(run_dir)
 

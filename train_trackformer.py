@@ -6,16 +6,24 @@ Standalone ColliderML -> track-parameter-regression training pipeline.
 
 This is a rebuild of your two Colab notebooks (Collider_ml_pu200_3_feature_eng.ipynb,
 End_to_End_Thesis_Pipeline.ipynb), restructured to run from the command line on a
-SLURM/GPU cluster, with four fixes ported in from Jeremy Couthures' TrackFormer repo
+SLURM/GPU cluster, with fixes ported in from Jeremy Couthures' TrackFormer repo
 (github.com/CouthuresJeremy/TrackFormer, branch all_params) that his own code relies on:
 
   1. Rotation-invariant input feature `dphi` (phi relative to each track's innermost
      hit) instead of, or in addition to, raw absolute phi/u/v.
-  2. Angle outputs (phi, theta) predicted as normalized (cos, sin) pairs, decoded via
+  2. `phi` target trained relative to the same innermost-hit reference angle used by
+     `dphi` (Jeremy's `dphi0` mechanism) -- an absolute lab-frame angle isn't
+     recoverable from rotation-invariant inputs. See restore_absolute_phi().
+  3. z-symmetry canonicalization (Jeremy's `apply_z_symmetry`) -- every track is
+     flipped, per-track, to a canonical +z-heading orientation, removing the
+     detector's forward/backward mirror symmetry the model would otherwise have to
+     learn to handle for free. Applied to the `z` hit feature and to the `z0`/`theta`
+     targets consistently. See restore_absolute_z().
+  4. Angle outputs (phi, theta) predicted as normalized (cos, sin) pairs, decoded via
      atan2, trained with a periodic loss `2*(1-cos(pred-target))` -- avoids the
      wraparound / boundary issues of regressing a raw angle.
-  3. Best-val-loss checkpointing (not just "whatever the last epoch produced").
-  4. Geometric-mean loss aggregation across the 5 track parameters (you'd already
+  5. Best-val-loss checkpointing (not just "whatever the last epoch produced").
+  6. Geometric-mean loss aggregation across the 5 track parameters (you'd already
      built this independently -- kept as-is).
 
 It also exposes the two experiment axes you asked about as CLI flags, so a SLURM
@@ -123,6 +131,39 @@ def engineer_features(hits_flat: pd.DataFrame) -> pd.DataFrame:
         hits_flat[col] = hits_flat[col].astype(np.float32)
 
     hits_flat["r"] = np.sqrt(hits_flat["x"] ** 2 + hits_flat["y"] ** 2).astype(np.float32)
+
+    # Sort inside-out (ascending radius) per track FIRST -- needed both for the
+    # z-symmetry reference (first 3 hits, below) and for the dphi reference
+    # (first hit) further down, and this is also the order hits_sequence is
+    # fed to the model in.
+    hits_flat = hits_flat.sort_values(["event_id", "particle_id", "r"])
+
+    # z-symmetry canonicalization, a la Jeremy's TrackFormer apply_z_symmetry()
+    # (src/datasets/datamodules.py, all_params branch): a collider detector is
+    # forward/backward symmetric in z, so "track heading toward +z" and "track
+    # heading toward -z" are physically equivalent up to an overall sign flip
+    # of every z-dependent quantity. Without canonicalizing this, the model
+    # has to learn both mirror-image cases as if they were unrelated, which
+    # inflates the effective spread of z0 (and any z-dependent hit feature)
+    # it has to fit. z_sign is computed once per track, from the mean dz
+    # (relative to the first hit) of that track's first 3 hits, and applied
+    # here to the z hit feature; the SAME z_sign is threaded through to
+    # build_dataset_frames() (via split_indices, exactly like phi_offset) so
+    # the z0/theta TARGETS get the identical flip -- restore_absolute_z()
+    # undoes it afterward for reporting/ACTS comparison.
+    rank = hits_flat.groupby(["event_id", "particle_id"]).cumcount()
+    first_z = hits_flat.groupby(["event_id", "particle_id"])["z"].transform("first")
+    dz_from_first = hits_flat["z"] - first_z
+    mean_dz_first3 = (
+        dz_from_first.where(rank < 3)
+        .groupby([hits_flat["event_id"], hits_flat["particle_id"]])
+        .transform("mean")
+    )
+    z_sign = np.sign(mean_dz_first3.to_numpy())
+    z_sign = np.where(z_sign == 0, 1.0, z_sign).astype(np.float32)  # exact tie -> no flip
+    hits_flat["z_sign"] = z_sign
+    hits_flat["z"] = (hits_flat["z"] * z_sign).astype(np.float32)
+
     hits_flat["s"] = np.clip(
         np.sqrt(hits_flat["x"] ** 2 + hits_flat["y"] ** 2 + hits_flat["z"] ** 2), 1e-7, None
     ).astype(np.float32)
@@ -136,8 +177,8 @@ def engineer_features(hits_flat: pd.DataFrame) -> pd.DataFrame:
     hits_flat["v"] = (hits_flat["y"] / r_sq).astype(np.float32)
 
     # Rotation-invariant relative azimuth, a la Jeremy's TrackFormer "dphi" input:
-    # sort by radius (inside-out) then subtract each track's innermost-hit phi.
-    hits_flat = hits_flat.sort_values(["event_id", "particle_id", "r"])
+    # subtract each track's innermost-hit phi (unaffected by the z flip above --
+    # phi only depends on x, y, which are never touched).
     first_phi = hits_flat.groupby(["event_id", "particle_id"])["phi"].transform("first")
     dphi = hits_flat["phi"] - first_phi
     dphi = np.where(dphi > np.pi, dphi - 2 * np.pi, dphi)
@@ -163,6 +204,50 @@ def _track_scatter_metrics(dphi_seq):
     n_kinks = int(np.sum(signs[1:] != signs[:-1])) if len(signs) >= 2 else 0
     max_kink = float(np.max(np.abs(d2))) if len(d2) else 0.0
     return n_kinks, max_kink
+
+
+def restore_absolute_phi(df):
+    """Convert `phi` (target) and `ml_phi` (prediction), if present, from the
+    relative-to-phi_offset frame they're trained/predicted in (see
+    build_dataset_frames()) back to absolute lab-frame angles, IN PLACE.
+    Call this once, right after test-set predictions are computed, before
+    any resolution/ACTS-comparison/reporting code -- NOT during training
+    (train/val loss is correctly computed in the relative frame the model
+    was trained on; the offset cancels out in a same-frame residual anyway,
+    so this conversion is only needed for physically-meaningful reporting
+    and comparison against ACTS, which reports absolute phi)."""
+    for col in ("phi", "ml_phi"):
+        if col in df.columns:
+            wrapped = df[col] + df["phi_offset"]
+            wrapped = np.where(wrapped > np.pi, wrapped - 2 * np.pi, wrapped)
+            wrapped = np.where(wrapped < -np.pi, wrapped + 2 * np.pi, wrapped)
+            df[col] = wrapped.astype(np.float32)
+    return df
+
+
+def restore_absolute_z(df):
+    """Undo the per-track z-symmetry flip (see engineer_features()) on `z0`/`ml_z0`
+    and `theta`/`ml_theta`, IN PLACE, converting them from the canonical-+z training
+    frame back to the true lab frame. Call alongside restore_absolute_phi(), once,
+    right after test-set predictions are computed -- NOT during training (the flip
+    is a bijection with itself, i.e. z_sign*z_sign == 1, so it doesn't change what
+    the model can learn; it's only wrong to leave in place when reporting physical
+    numbers or comparing against ACTS, which reports untouched lab-frame z0/theta).
+
+    z0 is a simple sign flip (z0_signed = z0_true * z_sign  =>  z0_true =
+    z0_signed * z_sign). theta is not: theta = arccos(pz/p), and flipping pz's
+    sign maps theta -> pi - theta (not -theta), so it's undone via
+    arccos(z_sign * cos(theta_signed)) instead of a plain sign flip."""
+    if "z_sign" not in df.columns:
+        return df
+    z_sign = df["z_sign"].to_numpy()
+    for col in ("z0", "ml_z0"):
+        if col in df.columns:
+            df[col] = (df[col] * z_sign).astype(np.float32)
+    for col in ("theta", "ml_theta"):
+        if col in df.columns:
+            df[col] = np.arccos(np.clip(z_sign * np.cos(df[col]), -1.0, 1.0)).astype(np.float32)
+    return df
 
 
 def build_dataset_frames(particles_flat, hits_flat, args):
@@ -227,11 +312,20 @@ def build_dataset_frames(particles_flat, hits_flat, args):
 
     p = np.clip(np.sqrt(good["px"] ** 2 + good["py"] ** 2 + good["pz"] ** 2), 1e-7, None)
     good["d0"] = good["perigee_d0"]
-    good["z0"] = good["perigee_z0"]
-    good["phi"] = np.arctan2(good["py"], good["px"])
-    good["theta"] = np.arccos(np.clip(good["pz"] / p, -1.0, 1.0))
-    good["eta"] = -np.log(np.tan(good["theta"] / 2.0))
-    good["qop"] = good["charge"] / p
+    # z0/theta are NOT finalized here -- they depend on the per-track z_sign
+    # computed from hits in engineer_features(), which isn't available until
+    # after the hits merge below. Kept as "_unsigned"/"_mag" for now; the
+    # actual z0/theta targets are set right after the z_sign_df merge further
+    # down (mirrors how the phi target isn't finalized until after the
+    # phi_offset_df merge). d0 needs no such treatment -- it's a transverse-
+    # plane quantity, untouched by the z-symmetry flip.
+    good["z0_unsigned"] = good["perigee_z0"]
+    good["pz_unsigned"] = good["pz"]
+    good["p_mag"] = p
+    # ABSOLUTE lab-frame azimuthal angle of the initial momentum direction --
+    # kept under this name deliberately, NOT "phi" (see below for why).
+    good["phi0_absolute"] = np.arctan2(good["py"], good["px"])
+    good["qop"] = good["charge"] / p  # p is a magnitude -- unaffected by the z-sign flip
 
     # Restrict hits to only the particles that survived the cuts above --
     # BEFORE running the expensive per-hit feature engineering (sort_values +
@@ -283,11 +377,58 @@ def build_dataset_frames(particles_flat, hits_flat, args):
     scatter_df["scatter_n_kinks"] = [m[0] for m in scatter_metrics]
     scatter_df["scatter_max_kink"] = [m[1] for m in scatter_metrics]
 
+    # Reference angle for the `phi` target below -- the SAME innermost-hit
+    # phi already used as the reference for the `dphi` INPUT feature inside
+    # engineer_features() (there: `first_phi`). Extracted here via the same
+    # split_indices used for hits_sequence/scatter_df above, so it's
+    # guaranteed to be the identical value by construction, not just by
+    # convention -- directly answers "are we using the same offset as the
+    # input features?": yes, deliberately, this IS that value.
+    phi_offset_vals = np.array([seq[0] for seq in np.split(hits_flat["phi"].values, split_indices)], dtype=np.float32)
+    phi_offset_df = hits_grouped[["event_id", "particle_id"]].copy()
+    phi_offset_df["phi_offset"] = phi_offset_vals
+
+    # z_sign for the z0/theta targets -- SAME per-track value already applied
+    # to the `z` hit feature in engineer_features() (constant across all of a
+    # track's hits by construction there, so seq[0] == every other entry).
+    z_sign_vals = np.array([seq[0] for seq in np.split(hits_flat["z_sign"].values, split_indices)], dtype=np.float32)
+    z_sign_df = hits_grouped[["event_id", "particle_id"]].copy()
+    z_sign_df["z_sign"] = z_sign_vals
+
     del hits_flat, raw_vals, dphi_seqs, scatter_metrics
     gc.collect()
 
     all_data = pd.merge(good, hits_grouped, on=["event_id", "particle_id"], how="inner")
     all_data = pd.merge(all_data, scatter_df, on=["event_id", "particle_id"], how="left")
+    all_data = pd.merge(all_data, phi_offset_df, on=["event_id", "particle_id"], how="left")
+    all_data = pd.merge(all_data, z_sign_df, on=["event_id", "particle_id"], how="left")
+
+    # z0/theta targets: finalized now that z_sign (from the track's own hits)
+    # is available -- see engineer_features()'s z-symmetry docstring and
+    # restore_absolute_z(). z0 is a plain sign flip; theta isn't (flipping
+    # pz's sign maps theta -> pi - theta, not -theta).
+    all_data["z0"] = (all_data["z0_unsigned"] * all_data["z_sign"]).astype(np.float32)
+    pz_signed = all_data["pz_unsigned"] * all_data["z_sign"]
+    all_data["theta"] = np.arccos(
+        np.clip(pz_signed / all_data["p_mag"], -1.0, 1.0)
+    ).astype(np.float32)
+
+    # `phi` target: expressed RELATIVE to phi_offset (the SAME reference the
+    # `dphi` input feature uses), matching Jeremy's "dphi0" output variable
+    # (src/datasets/datamodules.py, all_params branch): merged_df["dphi0"] =
+    # merged_df["phi0"] - merged_df["phi_offset"]. An ABSOLUTE lab-frame angle
+    # is not learnable from rotation-invariant inputs (r, dphi, z) -- those
+    # inputs deliberately discard which way the track points in the
+    # transverse plane, so the model has no way to recover it. The relative
+    # angle IS learnable, since it only depends on the track's own shape.
+    # `phi_offset` itself is kept as a column (not dropped) so predictions
+    # can be converted back to absolute phi afterward for physical reporting
+    # and ACTS comparison -- see main()'s test-eval section and _eval_vs_acts().
+    dphi0 = all_data["phi0_absolute"] - all_data["phi_offset"]
+    dphi0 = np.where(dphi0 > np.pi, dphi0 - 2 * np.pi, dphi0)
+    dphi0 = np.where(dphi0 < -np.pi, dphi0 + 2 * np.pi, dphi0)
+    all_data["phi"] = dphi0.astype(np.float32)
+
     n_before_dropna = len(all_data)
     all_data = all_data.dropna(subset=PARAM_NAMES).copy()
     n_dropped = n_before_dropna - len(all_data)
@@ -618,7 +759,18 @@ def main():
     # Architecture
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--nhead", type=int, default=4)
-    ap.add_argument("--num-layers", type=int, default=4)
+    ap.add_argument(
+        "--num-layers", type=int, default=8,
+        help="Jeremy's 5-parameter ODD/ttbar model (the closest architectural comparison "
+             "to this pipeline) uses 16 transformer layers at 32 embedding dims -- much "
+             "deeper than his simpler 2-parameter (q/p, pz) model, which uses only 2 layers "
+             "at 128 dims and does beat ACTS. Depth appears to matter more than width for "
+             "the harder multi-parameter task. Bumped the default here from 4 -> 8 (a "
+             "middle ground, not jumping straight to 16, since our train set is ~800 "
+             "events vs. the millions of events his fine-tuning stage used -- a much "
+             "deeper model risks being harder to train well on less data). Override with "
+             "--num-layers if you want to try 4, 16, or anything else.",
+    )
     ap.add_argument("--dim-feedforward", type=int, default=None)
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--input-dropout", type=float, default=0.0)
@@ -643,6 +795,16 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     # Eval / output
     ap.add_argument("--eval-acts", action="store_true", help="Download ACTS reco tracks for test events and compare")
+    ap.add_argument(
+        "--resume", default=None,
+        help="Path to a checkpoint_latest.pt from a previous (e.g. killed by a "
+             "SLURM --time limit) run of this SAME config/--out-dir to continue "
+             "training from, instead of starting over. Restores model, optimizer, "
+             "scheduler, and history state; training resumes at the next epoch "
+             "after the checkpoint's. Does NOT reload data -- data loading always "
+             "reruns (fast now: ~7 min at 950 events), so this only saves the "
+             "training-time cost, which is the dominant cost for a long run.",
+    )
     ap.add_argument("--out-dir", default="runs/exp")
     args = ap.parse_args()
     if args.norm_loss == "none":
@@ -739,9 +901,30 @@ def main():
     best_val = float("inf")
     best_epoch = -1
     best_path = out_dir / "model_best.pt"
+    resume_path = out_dir / "checkpoint_latest.pt"
+    start_epoch = 0
+
+    if args.resume:
+        ckpt_path = Path(args.resume)
+        print(f"Resuming from {ckpt_path} ...")
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val = ckpt["best_val"]
+        best_epoch = ckpt["best_epoch"]
+        history = ckpt["history"]
+        print(
+            f"Resumed at epoch {start_epoch}/{args.epochs} "
+            f"(best_val={best_val:.5f} at epoch {best_epoch+1})."
+        )
+        if start_epoch >= args.epochs:
+            print("Resume checkpoint's epoch already >= --epochs; nothing left to train.")
+
     t_train_start = time.time()
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         t_epoch = time.time()
         tr_loss, tr_param = run_epoch(
             model, train_loader, criteria, args, device, optimizer, scheduler, target_std=target_std
@@ -762,6 +945,24 @@ def main():
                 {"model_state": model.state_dict(), "epoch": epoch, "val_loss": val_loss},
                 best_path,
             )
+
+        # Full resumable checkpoint, overwritten every epoch (not just on
+        # improvement) -- unlike model_best.pt, this includes optimizer and
+        # scheduler state plus the running history, so a job killed mid-run
+        # (e.g. hitting a SLURM --time limit) can be continued with
+        # --resume checkpoint_latest.pt instead of restarting from scratch.
+        torch.save(
+            {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "epoch": epoch,
+                "best_val": best_val,
+                "best_epoch": best_epoch,
+                "history": history,
+            },
+            resume_path,
+        )
 
         if (epoch + 1) % 5 == 0 or epoch == args.epochs - 1:
             print(
@@ -830,6 +1031,15 @@ def main():
     preds = np.vstack(all_preds)
     for i, name in enumerate(PARAM_NAMES):
         test_df[f"ml_{name}"] = preds[:, i]
+
+    # Convert phi/ml_phi from the relative-to-phi_offset training frame, and
+    # z0/theta (+ ml_z0/ml_theta) from the z-symmetry-canonicalized training
+    # frame, back to physical lab-frame values -- see restore_absolute_phi()
+    # and restore_absolute_z() docstrings. Everything from here on
+    # (resolutions, ACTS comparison, saved pickles, error-breakdown plots)
+    # sees ordinary absolute phi/z0/theta transparently.
+    restore_absolute_phi(test_df)
+    restore_absolute_z(test_df)
 
     # Save the per-track predictions (not just aggregate resolutions) -- needed
     # for pT-binned / hit-count-binned / fractional-error plots downstream.
