@@ -9,14 +9,7 @@
 #SBATCH --mem=150G
 #SBATCH --partition=GPU
 #SBATCH --gres=gpu:a100:1
-#SBATCH --array=0-1            # 2 seeds of "separate" only
-#
-# "shared" + pos-encoding none, seeds 0 and 1, are already covered by
-# exp1_posenc_none_seed{0,1} (identical config) -- reused, not retrained.
-#
-# PREREQUISITE: exp1_posenc.slurm's "none" tasks (seeds 0 and 1) must have
-# already finished and produced runs/exp1_posenc_none_seed{0,1}/ before you
-# run the comparison step at the bottom of this file.
+#SBATCH --array=0-1            # 2 seeds of "separate" only -- "shared" baseline == exp1_posenc_none_seed0
 
 eval "$(~/.local/bin/micromamba shell hook --shell bash)"
 micromamba activate paramreg_env
@@ -24,27 +17,18 @@ micromamba activate paramreg_env
 cd /home/xucabm80/ParamRegression
 pip install -q -r requirements.txt   # one-time; harmless if already installed
 
-# EXPERIMENT 2: Shared regression head (Jeremy's design) vs. independent head
-# per parameter, both with pos-encoding=none (matching Jeremy's actual
-# configs -- positional_encoding: null in his model yamls), 2 seeds each.
+# EXPERIMENT 2: shared regression head vs. independent head per parameter, pos-encoding=none.
 SEEDS=(0 1)
 SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
-# To restrict training to muons only (|pdg_id|==13, both charge signs) --
-# matching Jeremy's actual single-muon training set instead of all primary
-# ttbar particle species -- set PARTICLE_TYPE_FLAG below to "--particle-types 13".
-# Currently empty = disabled (train on all primary species, current default).
-# NOTE: muons are a small fraction of particles per event, so --max-events
-# would need to go up substantially to still hit --train-events/--test-events
-# worth of muon tracks -- check the "[filters] |pdg_id| in ..." line in the
-# run's output to see the actual survival rate before committing to a full run.
+# --particle-types 13 to restrict to muons only; empty = all primary species.
 PARTICLE_TYPE_FLAG=""
 
 python -u train_trackformer.py \
     --channel ttbar --pileup pu200 \
     --max-events 950 --train-events 800 --test-events 100 \
     --features r dphi z \
-    --d-model 128 --nhead 4 --num-layers 4 \
+    --d-model 128 --nhead 4 --num-layers 8 \
     --pos-encoding none \
     --head-mode separate \
     --seed ${SEED} \
@@ -55,9 +39,8 @@ python -u train_trackformer.py \
 
 python analyze_results.py --run-dir runs/exp2_head_separate_seed${SEED}
 
-# Aggregate against the reused "shared" runs from exp1 (do NOT retrain them):
+# Compare against exp1_posenc_none_seed0 (shared head, seed 0 only):
 #   python compare_runs.py \
-#       --run-dirs runs/exp1_posenc_none_seed0  runs/exp1_posenc_none_seed1 \
-#                  runs/exp2_head_separate_seed0 runs/exp2_head_separate_seed1 \
-#       --labels   shared shared separate separate \
+#       --run-dirs runs/exp1_posenc_none_seed0 runs/exp2_head_separate_seed0 runs/exp2_head_separate_seed1 \
+#       --labels   shared                      separate                     separate \
 #       --out-dir runs/exp2_head_comparison
