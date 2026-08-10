@@ -78,6 +78,37 @@ def main():
     phi_res = wrap(post["ml_phi"].to_numpy() - post["phi"].to_numpy())
     print(pd.Series(phi_res).describe())
 
+    # --- Step 7a: are theta's big errors specifically the tracks where the
+    # z_sign heuristic (first-3-hits) likely disagreed with the track's real
+    # direction? Proxy: pre-restore theta_signed should sit in [0, pi/2] for
+    # a "clean" flip -- tracks where it exceeds that are the suspects.
+    print("\n--- Step 7a: theta residual vs. pre-restore theta being out of [0, pi/2] ---")
+    theta_signed = pre["theta"].to_numpy()
+    out_of_range = theta_signed > (np.pi / 2)
+    print(f"Tracks with pre-restore theta > pi/2: {out_of_range.sum()} / {len(out_of_range)} ({out_of_range.mean():.1%})")
+    abs_res = np.abs(theta_res)
+    print(f"Mean |theta residual| for out-of-range tracks: {abs_res[out_of_range].mean():.4f}")
+    print(f"Mean |theta residual| for in-range tracks:     {abs_res[~out_of_range].mean():.4f}")
+    large_res = abs_res > 1.0
+    print(f"Fraction of out-of-range tracks with |residual| > 1.0: {large_res[out_of_range].mean():.1%}")
+    print(f"Fraction of in-range tracks with |residual| > 1.0:     {large_res[~out_of_range].mean():.1%}")
+
+    # --- Step 7b: does phi's near-constant bias correlate with anything obvious
+    # (its own reference angle, track pT, or hit count)? ---
+    print("\n--- Step 7b: phi residual vs. phi_offset / pt / hit count ---")
+    check_cols = {"phi_res": phi_res}
+    for col in ("phi_offset", "pt", "calculated_hits"):
+        if col in pre.columns:
+            check_cols[col] = pre[col].to_numpy()
+        else:
+            print(f"  (column '{col}' not found in test_data.pkl, skipping)")
+    df_check = pd.DataFrame(check_cols)
+    print(df_check.corr()["phi_res"])
+    if "pt" in df_check.columns:
+        print("\nMean phi_res by pt decile:")
+        df_check["pt_decile"] = pd.qcut(df_check["pt"], 10, duplicates="drop")
+        print(df_check.groupby("pt_decile", observed=True)["phi_res"].mean())
+
 
 if __name__ == "__main__":
     main()
