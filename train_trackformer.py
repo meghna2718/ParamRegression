@@ -528,7 +528,16 @@ def geometric_multi_task_loss(preds, targets, criteria, aggregate="geometric_mea
     losses = []
     for i, crit in enumerate(criteria):
         p_i, t_i = preds[:, i], targets[:, i]
-        if norm_loss == "std":
+        # std-normalization only makes sense for plain MSE (puts d0/z0/qop on a
+        # comparable scale). Applying it to mse_angle would divide a genuine
+        # radian difference by an unrelated std BEFORE taking its cosine,
+        # destroying the periodicity the cosine loss exists to handle -- e.g.
+        # dividing by a tiny std can turn a small real error into something
+        # that wraps around the circle several times, scoring it as if it
+        # were near-perfect or maximally wrong almost at random. This was also
+        # present in Jeremy's original code (unconditionally applied to every
+        # parameter, angle or not) -- a real bug there too, not just here.
+        if norm_loss == "std" and crit.mode != "mse_angle":
             # Fixed, precomputed per-parameter std (see main()) -- avoids NaN
             # from torch.std() on a size-1 batch (n-1=0 denominator).
             std = target_std[i] if target_std is not None else torch.std(t_i).clamp(min=1e-6)
@@ -646,7 +655,13 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--min-lr", type=float, default=1e-6)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
-    ap.add_argument("--warmup-steps", type=int, default=100)
+    ap.add_argument(
+        "--warmup-steps", type=int, default=3000,
+        help="Bumped up from 100 -- deeper post-LN transformers (--num-layers 8) "
+             "are more prone to early training instability and need more warmup "
+             "than shallow ones. ~3000 steps is roughly a full epoch here, still "
+             "small relative to the ~2M total training steps.",
+    )
     ap.add_argument("--seed", type=int, default=0)
     # Eval / output
     ap.add_argument("--eval-acts", action="store_true", help="Download ACTS reco tracks for test events and compare")
