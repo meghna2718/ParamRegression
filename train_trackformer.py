@@ -662,6 +662,13 @@ def main():
              "than shallow ones. ~3000 steps is roughly a full epoch here, still "
              "small relative to the ~2M total training steps.",
     )
+    ap.add_argument(
+        "--early-stop-patience", type=int, default=0,
+        help="Stop once val_loss hasn't improved for this many epochs. 0 = disabled "
+             "(always train the full --epochs). Prevents wasting compute drifting past "
+             "convergence at high LR -- the mechanism behind the mid-training collapses "
+             "seen in earlier long runs.",
+    )
     ap.add_argument("--seed", type=int, default=0)
     # Eval / output
     ap.add_argument("--eval-acts", action="store_true", help="Download ACTS reco tracks for test events and compare")
@@ -806,6 +813,13 @@ def main():
                 best_path,
             )
 
+        if args.early_stop_patience > 0 and (epoch - best_epoch) >= args.early_stop_patience:
+            print(
+                f"Early stop at epoch {epoch+1}: no val_loss improvement for "
+                f"{args.early_stop_patience} epochs (best {best_val:.5f} at epoch {best_epoch+1})."
+            )
+            break
+
         # Full resumable checkpoint, overwritten every epoch (includes
         # optimizer/scheduler state + history, unlike model_best.pt).
         torch.save(
@@ -828,21 +842,24 @@ def main():
             )
 
     training_seconds = time.time() - t_train_start
-    torch.save({"model_state": model.state_dict(), "epoch": args.epochs - 1, "val_loss": val_loss}, out_dir / "model_last.pt")
+    epochs_run = len(history["val_loss"])  # actual epochs completed, <= args.epochs if early-stopped
+    torch.save({"model_state": model.state_dict(), "epoch": epochs_run - 1, "val_loss": val_loss}, out_dir / "model_last.pt")
     with open(out_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
     test_df.to_pickle(out_dir / "test_data.pkl")
     if best_epoch == -1:
         print(
-            f"WARNING: val_loss never finite/improving across all {args.epochs} epochs "
+            f"WARNING: val_loss never finite/improving across all {epochs_run} epochs run "
             f"(best_val={best_val}) -- {best_path} was NOT created. Check "
             f"training_history.json's val_param_loss for NaN/inf."
         )
     else:
         print(
-            f"Best val loss: {best_val:.5f} at epoch {best_epoch+1}/{args.epochs} (saved to {best_path}) | "
-            f"training took {training_seconds/60:.1f} min ({training_seconds/args.epochs:.2f} s/epoch avg)"
+            f"Best val loss: {best_val:.5f} at epoch {best_epoch+1}/{epochs_run} (saved to {best_path}) | "
+            f"training took {training_seconds/60:.1f} min ({training_seconds/epochs_run:.2f} s/epoch avg)"
         )
+        if epochs_run < args.epochs:
+            print(f"Early-stopped after {epochs_run}/{args.epochs} configured epochs.")
 
     run_summary = {
         "train_events": args.train_events,
@@ -851,12 +868,14 @@ def main():
         "n_val_tracks": n_val,
         "n_test_tracks": len(test_df),
         "epochs_configured": args.epochs,
+        "epochs_run": epochs_run,
+        "early_stopped": epochs_run < args.epochs,
         "best_epoch": best_epoch + 1,  # 1-indexed for readability
         "best_val_loss": best_val,
         "final_val_loss": val_loss,
         "data_load_seconds": data_load_seconds,
         "training_seconds": training_seconds,
-        "avg_seconds_per_epoch": training_seconds / args.epochs,
+        "avg_seconds_per_epoch": training_seconds / epochs_run,
         "seconds_to_reach_best_epoch": sum(history["epoch_seconds"][: best_epoch + 1]),
     }
     with open(out_dir / "run_summary.json", "w") as f:
