@@ -1109,9 +1109,24 @@ def _eval_vs_acts(test_df, test_event_ids, args, out_dir):
     with open(out_dir / "acts_comparison.json", "w") as f:
         json.dump(comparison, f, indent=2)
 
-    # Full per-track merged dataframe -- needed for pT/hit-count-binned plots.
-    comp.to_pickle(out_dir / "comparison_df.pkl")
-    print(f"Saved per-track comparison dataframe ({len(comp)} tracks) to comparison_df.pkl")
+    # Full per-track merged dataframe (incl. hits_sequence) -- was crashing with
+    # MemoryError on pickle (multi-GB, hits_sequence is the main bulk). Disabled;
+    # uncomment if you need the raw hit sequences for something specific.
+    # comp.to_pickle(out_dir / "comparison_df.pkl")
+    # print(f"Saved per-track comparison dataframe ({len(comp)} tracks) to comparison_df.pkl")
+
+    # Cheaper alternative: just the scalar columns needed for downstream
+    # pT/hit-count-binned analysis (truth, ml_*, acts_*, pt, calculated_hits) --
+    # drops hits_sequence and any other heavy per-track arrays, and writes
+    # parquet instead of pickle (smaller, columnar, no MemoryError risk).
+    light_cols = [c for c in (
+        list(PARAM_NAMES)
+        + [f"ml_{p}" for p in PARAM_NAMES]
+        + [f"acts_{p}" for p in PARAM_NAMES]
+        + ["pt", "calculated_hits", "event_id", "particle_id"]
+    ) if c in comp.columns]
+    comp[light_cols].to_parquet(out_dir / "comparison_light.parquet", index=False)
+    print(f"Saved lightweight per-track comparison table ({len(comp)} tracks, {len(light_cols)} cols) to comparison_light.parquet")
 
 
 if __name__ == "__main__":
