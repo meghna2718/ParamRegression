@@ -9,24 +9,18 @@
 #SBATCH --mem=150G
 #SBATCH --partition=GPU
 #SBATCH --gres=gpu:a100:1
-#SBATCH --array=0-5            # 3 new model-size points + 3 new data-size points
+#SBATCH --array=0-5            # tasks 0-5 done; task 6 (model_gap) is new -- submit with --array=6
 
 eval "$(~/.local/bin/micromamba shell hook --shell bash)"
 micromamba activate paramreg_env
 
 cd /home/xucabm80/ParamRegression
-pip install -q -r requirements.txt   # one-time; harmless if already installed
+pip install -q -r requirements.txt
 
-# EXPERIMENT 4: scaling-law sweep. Two axes, each swept independently at 4
-# points (3 new here + the exp3 run as the shared anchor at 128-dim/8-layer,
-# 800 events -- do NOT rerun that one). Everything else held at exp3's recipe
-# (norm_loss none, weight_decay 0.01, early stopping) so only model size or
-# data size differs between points on the same axis.
-# Metric: best_val_loss (run_summary.json) + per-param resolution
-# (test_resolutions.json), both saved by every run automatically.
+# Scaling-law sweep: model-size and data-size axes, anchor = exp3 run.
 RUN_TAG="v1"
 
-# task: label            d_model  num_layers  train_events  test_events  max_events
+# label                  d_model  num_layers  train_events  test_events  max_events
 TASKS=(
   "model_small           32       2           800           100          950"
   "model_medium           64       4           800           100          950"
@@ -34,6 +28,7 @@ TASKS=(
   "data_small            128      8           200           100          350"
   "data_medium           128      8           400           100          550"
   "data_large            128      8           1500          100          1650"
+  "model_gap             96       6           800           100          950"
 )
 
 read -r LABEL D_MODEL NUM_LAYERS TRAIN_EVENTS TEST_EVENTS MAX_EVENTS <<< "${TASKS[$SLURM_ARRAY_TASK_ID]}"
@@ -56,8 +51,12 @@ python -u train_trackformer.py \
 
 python analyze_results.py --run-dir runs/exp4_scale_${LABEL}_${RUN_TAG}
 
-# After all 6 tasks finish, combine with the exp3 anchor run and plot:
+# Full sweep plot (model_large -> _v2 retry, data_large -> exp5's retry):
 #   python scaling_plot.py \
-#       --model-sweep-dirs runs/exp4_scale_model_small_v1 runs/exp4_scale_model_medium_v1 runs/exp3_fix_v3_stability_fix_seed0 runs/exp4_scale_model_large_v1 \
-#       --data-sweep-dirs  runs/exp4_scale_data_small_v1  runs/exp4_scale_data_medium_v1  runs/exp3_fix_v3_stability_fix_seed0 runs/exp4_scale_data_large_v1 \
+#       --model-sweep-dirs runs/exp4_scale_model_small_v1 runs/exp4_scale_model_medium_v1 \
+#                           runs/exp4_scale_model_gap_v1 \
+#                           runs/exp3_fix_v3_stability_fix_seed0 runs/exp4_scale_model_large_v2 \
+#       --data-sweep-dirs  runs/exp4_scale_data_small_v1 runs/exp4_scale_data_medium_v1 \
+#                           runs/exp3_fix_v3_stability_fix_seed0 runs/exp5_data_1500_v2 \
+#                           runs/exp5_data_3000 runs/exp5_data_6000 \
 #       --out-dir runs/exp4_scaling_plots
