@@ -656,11 +656,23 @@ def main():
     ap.add_argument("--min-lr", type=float, default=1e-6)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument(
-        "--warmup-steps", type=int, default=3000,
-        help="Bumped up from 100 -- deeper post-LN transformers (--num-layers 8) "
-             "are more prone to early training instability and need more warmup "
-             "than shallow ones. ~3000 steps is roughly a full epoch here, still "
-             "small relative to the ~2M total training steps.",
+        "--warmup-steps", type=int, default=None,
+        help="Fixed warmup step count. If unset (default), --warmup-frac is used "
+             "instead, which scales automatically with dataset/batch/epoch size. "
+             "Set this explicitly only if you want a literal fixed step count "
+             "regardless of those.",
+    )
+    ap.add_argument(
+        "--warmup-frac", type=float, default=0.05,
+        help="Warmup as a fraction of total training steps (max_steps), used "
+             "when --warmup-steps is not set. Auto-scales with train-events, "
+             "batch-size, and epochs -- fixes the failure mode where a fixed "
+             "step count covers a shrinking fraction of training as data/epochs "
+             "grow. Does NOT auto-scale with model depth/width -- deeper or "
+             "wider models (e.g. --num-layers well above ~8-10, or large "
+             "--d-model) are still more prone to early instability at a fixed "
+             "LR and may need a lower --lr and/or larger --warmup-frac on top "
+             "of this.",
     )
     ap.add_argument(
         "--early-stop-patience", type=int, default=0,
@@ -761,7 +773,11 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     max_steps = len(train_loader) * min(1000, args.epochs)
-    scheduler = CosineWarmupScheduler(optimizer, args.warmup_steps, max_steps, args.min_lr)
+    warmup_steps = args.warmup_steps if args.warmup_steps is not None else max(1, int(args.warmup_frac * max_steps))
+    print(f"max_steps={max_steps} | warmup_steps={warmup_steps} ({100*warmup_steps/max_steps:.1f}% of max_steps)")
+    with open(out_dir / "config.json", "w") as f:
+        json.dump({**vars(args), "n_params": n_params, "max_steps": max_steps, "warmup_steps_used": warmup_steps}, f, indent=2, default=str)
+    scheduler = CosineWarmupScheduler(optimizer, warmup_steps, max_steps, args.min_lr)
 
     # ---- Train ----
     history = {"train_loss": [], "val_loss": [], "train_param_loss": [], "val_param_loss": [], "epoch_seconds": []}
@@ -1116,14 +1132,16 @@ def _eval_vs_acts(test_df, test_event_ids, args, out_dir):
     # print(f"Saved per-track comparison dataframe ({len(comp)} tracks) to comparison_df.pkl")
 
     # Cheaper alternative: just the scalar columns needed for downstream
-    # pT/hit-count-binned analysis (truth, ml_*, acts_*, pt, calculated_hits) --
-    # drops hits_sequence and any other heavy per-track arrays, and writes
-    # parquet instead of pickle (smaller, columnar, no MemoryError risk).
+    # pT/hit-count-binned analysis (truth, ml_*, acts_*, pt, calculated_hits)
+    # PLUS pdg_id/scatter_n_kinks (needed by error_breakdown.py's species/
+    # scattering plots) -- drops hits_sequence and any other heavy per-track
+    # arrays, and writes parquet instead of pickle (smaller, columnar, no
+    # MemoryError risk).
     light_cols = [c for c in (
         list(PARAM_NAMES)
         + [f"ml_{p}" for p in PARAM_NAMES]
         + [f"acts_{p}" for p in PARAM_NAMES]
-        + ["pt", "calculated_hits", "event_id", "particle_id"]
+        + ["pt", "calculated_hits", "event_id", "particle_id", "pdg_id", "scatter_n_kinks"]
     ) if c in comp.columns]
     comp[light_cols].to_parquet(out_dir / "comparison_light.parquet", index=False)
     print(f"Saved lightweight per-track comparison table ({len(comp)} tracks, {len(light_cols)} cols) to comparison_light.parquet")
