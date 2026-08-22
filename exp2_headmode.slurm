@@ -26,7 +26,12 @@ pip install -q -r requirements.txt   # one-time; harmless if already installed
 # RUN_TAG: bump this string for any future rerun of this script so new
 # results land in fresh runs/ directories instead of overwriting these ones
 # (e.g. change to "v3" next time). No manual `mv`-ing of old run folders needed.
-RUN_TAG="v2_150ep"
+#
+# v3_150ep_fixed: v2_150ep collapsed on 4/6 seeds -- old fixed warmup_steps=3000
+# exceeded this run's max_steps (~1050), so the scheduler never left warmup and
+# LR climbed the whole run instead of decaying. Now uses auto --warmup-frac plus
+# --early-stop-patience so it stops once it stalls instead of drifting.
+RUN_TAG="v3_150ep_fixed"
 
 HEAD_MODES=(shared separate)
 SEEDS=(0 1 2)
@@ -46,6 +51,7 @@ python -u train_trackformer.py \
     --head-mode ${HEAD_MODE} \
     --seed ${SEED} \
     --batch-size 128 --epochs 150 --lr 1e-3 \
+    --early-stop-patience 20 \
     --eval-acts \
     ${PARTICLE_TYPE_FLAG} \
     --out-dir runs/exp2_head_${HEAD_MODE}_${RUN_TAG}_seed${SEED}
@@ -54,7 +60,7 @@ python analyze_results.py --run-dir runs/exp2_head_${HEAD_MODE}_${RUN_TAG}_seed$
 
 # After all 6 array tasks finish, compare (repeated labels -> mean +/- std per head_mode):
 #   python compare_runs.py \
-#       --run-dirs runs/exp2_head_shared_v2_150ep_seed0   runs/exp2_head_shared_v2_150ep_seed1   runs/exp2_head_shared_v2_150ep_seed2 \
-#                  runs/exp2_head_separate_v2_150ep_seed0 runs/exp2_head_separate_v2_150ep_seed1 runs/exp2_head_separate_v2_150ep_seed2 \
+#       --run-dirs runs/exp2_head_shared_v3_150ep_fixed_seed0   runs/exp2_head_shared_v3_150ep_fixed_seed1   runs/exp2_head_shared_v3_150ep_fixed_seed2 \
+#                  runs/exp2_head_separate_v3_150ep_fixed_seed0 runs/exp2_head_separate_v3_150ep_fixed_seed1 runs/exp2_head_separate_v3_150ep_fixed_seed2 \
 #       --labels   shared shared shared separate separate separate \
-#       --out-dir runs/exp2_head_comparison_v2_150ep
+#       --out-dir runs/exp2_head_comparison_v3_150ep_fixed
