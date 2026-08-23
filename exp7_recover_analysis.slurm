@@ -7,9 +7,12 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=100G
-# No GPU needed -- CPU inference on ~800 train/100 test tracks is fast, and
-# this skips the GPU queue entirely. Uses cluster default partition; if that
-# fails, run `sinfo -s` to see partition names and add e.g. #SBATCH --partition=CPU.
+#SBATCH --partition=GPU
+#SBATCH --gres=gpu:a100:1
+# Reverted to GPU partition -- the COMPUTE partition produced no output at
+# all after 25min (possible filesystem/mount issue on that node), while GPU
+# partition jobs are confirmed working reliably. Not worth debugging further
+# with a deadline tomorrow -- GPU is barely used by this script anyway.
 
 eval "$(~/.local/bin/micromamba shell hook --shell bash)"
 micromamba activate paramreg_env
