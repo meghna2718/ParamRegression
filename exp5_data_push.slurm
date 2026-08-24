@@ -6,10 +6,13 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=200G
+#SBATCH --mem=240G
 #SBATCH --partition=GPU
 #SBATCH --gres=gpu:a100:1
-#SBATCH --array=0-2            # 1500 (retry, fixed), 3000, 6000 -- pushing the data-size axis
+#SBATCH --array=0-2%1          # %1 = run one task at a time -- data_3000/6000 previously
+                                # OOM'd (Rust allocator failing on ~1MB allocs) when both
+                                # landed on the same node concurrently, combined memory
+                                # exceeding what was actually available despite --mem=200G each
 
 eval "$(~/.local/bin/micromamba shell hook --shell bash)"
 micromamba activate paramreg_env
