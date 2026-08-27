@@ -267,6 +267,10 @@ def build_dataset_frames(particles_flat, hits_flat, args):
     split_indices = np.cumsum(hit_counts["calculated_hits"].values)[:-1]
 
     raw_vals = hits_flat[args.features].values
+    if args.normalize_features:
+        for i, feat in enumerate(args.features):
+            if feat in ("r", "z"):
+                raw_vals[:, i] = raw_vals[:, i] / 1000.0
     seqs = np.split(raw_vals, split_indices)
     hits_grouped = hit_counts[["event_id", "particle_id"]].copy()
     hits_grouped["hits_sequence"] = seqs
@@ -625,6 +629,12 @@ def main():
     ap.add_argument(
         "--features", nargs="+", default=["r", "dphi", "z"],
         help="Any of: x y z r s theta_hit phi eta u v dphi",
+    )
+    ap.add_argument(
+        "--normalize-features", action="store_true",
+        help="Divide r/z by 1000 before feeding to the model (mm -> m scale). "
+             "dphi/eta/phi/theta_hit already bounded to O(1), left as-is. Off by default "
+             "(matches Jeremy's original code -- confirmed no input normalization there either).",
     )
     ap.add_argument("--angle-params", nargs="+", default=DEFAULT_ANGLE_PARAMS, choices=PARAM_NAMES)
     # Architecture
