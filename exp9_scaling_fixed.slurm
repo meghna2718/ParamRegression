@@ -9,22 +9,25 @@
 #SBATCH --mem=150G
 #SBATCH --partition=GPU
 #SBATCH --gres=gpu:a100:1
-#SBATCH --array=0-3
+#SBATCH --array=0-7
 
 eval "$(~/.local/bin/micromamba shell hook --shell bash)"
 micromamba activate paramreg_env
 cd /home/xucabm80/ParamRegression
 
-# Model-size scaling sweep. Epochs/patience fixed across all configs so
-# architecture is the only real variable; lr/warmup staggered down/up with
-# size since that's needed for stability, not a free choice.
+# Full model-size scaling sweep. pos-encoding=none (sinusoidal collapsed
+# under this recipe). Same 200ep/patience-30 schedule for all points.
 
 # label          d_model  num_layers  lr      warmup_frac
 TASKS=(
-  "model_large     256      12          5e-4    0.10"
-  "model_xlarge    384      16          4e-4    0.10"
-  "model_xxlarge   512      16          3.5e-4  0.12"
-  "model_huge      640      20          3e-4    0.15"
+  "model_d32       32       2           1e-3    0.05"
+  "model_d64       64       4           1e-3    0.05"
+  "model_d96       96       6           1e-3    0.05"
+  "model_d128      128      8           1e-3    0.05"
+  "model_d192      192      10          7e-4    0.07"
+  "model_d256      256      12          5e-4    0.10"
+  "model_d320      320      14          4e-4    0.10"
+  "model_d384      384      16          4e-4    0.10"
 )
 read -r LABEL D_MODEL NUM_LAYERS LR WARMUP_FRAC <<< "${TASKS[$SLURM_ARRAY_TASK_ID]}"
 echo "Task $SLURM_ARRAY_TASK_ID: $LABEL  d_model=$D_MODEL  num_layers=$NUM_LAYERS  lr=$LR  warmup_frac=$WARMUP_FRAC"
@@ -34,22 +37,22 @@ python -u train_trackformer.py \
     --max-events 950 --train-events 800 --test-events 100 \
     --features r dphi z \
     --d-model ${D_MODEL} --nhead 4 --num-layers ${NUM_LAYERS} \
-    --pos-encoding sinusoidal --head-mode shared \
+    --pos-encoding none --head-mode shared \
     --norm-loss none --weight-decay 0.01 \
     --seed 0 --batch-size 128 --epochs 200 --lr ${LR} \
     --warmup-frac ${WARMUP_FRAC} \
     --early-stop-patience 30 \
     --eval-acts \
-    --out-dir runs/exp9_scale_${LABEL}
+    --out-dir runs/exp9_scale_${LABEL}_noposenc
 
-python analyze_results.py --run-dir runs/exp9_scale_${LABEL}
+python analyze_results.py --run-dir runs/exp9_scale_${LABEL}_noposenc
 
-# Replot after all finish (anchor = exp2_head_shared_v3_150ep_fixed_seed1).
-# --acts-ref-dir adds a flat ACTS reference line; drop the flag to remove it.
+# Replot:
 #   python scaling_plot.py \
-#       --model-sweep-dirs runs/exp4_scale_model_small_v1 runs/exp4_scale_model_medium_v1 \
-#                           runs/exp4_scale_model_gap_v1 runs/exp2_head_shared_v3_150ep_fixed_seed1 \
-#                           runs/exp9_scale_model_large runs/exp9_scale_model_xlarge \
-#                           runs/exp9_scale_model_xxlarge runs/exp9_scale_model_huge \
-#       --out-dir runs/exp9_scaling_plots \
-#       --acts-ref-dir runs/exp2_head_shared_v3_150ep_fixed_seed1
+#       --model-sweep-dirs runs/exp9_scale_model_d32_noposenc runs/exp9_scale_model_d64_noposenc \
+#                           runs/exp9_scale_model_d96_noposenc runs/exp9_scale_model_d128_noposenc \
+#                           runs/exp9_scale_model_d192_noposenc runs/exp9_scale_model_d256_noposenc \
+#                           runs/exp9_scale_model_d320_noposenc runs/exp9_scale_model_d384_noposenc \
+#       --data-sweep-dirs  runs/exp9_scale_model_d128_noposenc \
+#       --out-dir runs/exp9_scaling_plots_noposenc \
+#       --acts-ref-dir runs/exp9_scale_model_d128_noposenc
