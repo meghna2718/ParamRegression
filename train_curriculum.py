@@ -227,17 +227,20 @@ def fit_batch_vectorized(hits, mask, B_tesla=2.0, dtype=torch.float32, max_iter=
     }
 
 
-def truncated_gaussian_resolution(residuals, n_iter=5, n_sigma=3.0):
-    """Iteratively truncated mean/std - robust to outlier tracks.
-    Returns (bias, resolution, n_kept)."""
+def robust_resolution(residuals):
+    """IQR/1.349 -- the same resolution metric used throughout Study 1,
+    chosen so both studies report resolution the same way without relying
+    on a Gaussian-fit assumption."""
     r = np.asarray(residuals)
-    for _ in range(n_iter):
-        mu, sigma = r.mean(), r.std()
-        keep = np.abs(r - mu) < n_sigma * sigma
-        if keep.sum() == len(r):
-            break
-        r = r[keep]
-    return r.mean(), r.std(), len(r)
+    q75, q25 = np.percentile(r, [75, 25])
+    return (q75 - q25) / 1.349
+
+
+def robust_bias(residuals):
+    """Median residual -- paired with robust_resolution as the location
+    estimate, matching the median+IQR robust-statistics convention (in
+    place of mean+std)."""
+    return float(np.median(residuals))
 
 
 # Sanity check: fit correctness at high precision, independent of the
@@ -513,7 +516,7 @@ def evaluate_full(model, stage, target="q_over_pt", eval_size=10000, seed=12345,
     beats_baseline = mse < base_mse
 
     rel = (pred_np - truth_np) / np.where(truth_np != 0, truth_np, 1.0)
-    bias, resolution, n_kept = truncated_gaussian_resolution(rel)
+    bias, resolution = robust_bias(rel), robust_resolution(rel)
 
     # RMSE reported alongside MSE -- matches the Precision ML paper's own
     # unit (e.g. "SciPy BFGS achieves 1e-7 RMSE"), so this is the number to
@@ -674,7 +677,36 @@ def make_summary(results_df, stages, out_dir):
     print("\nStages where the model beat the least-squares baseline in EVERY seed:")
     beats = summary[(summary["label"] == "adam_plus_bfgs") & (summary["beats_baseline_all"])]
     print(beats[["stage"]].to_string(index=False) if len(beats) else "  none")
+
+    make_band_plot(summary, stages, out_dir)
     return summary
+
+
+def make_band_plot(summary, stages, out_dir):
+    """Same data as make_summary()'s errorbar plot, drawn instead as a
+    shaded mean +/- std band -- easier to read the seed spread across all
+    stages at a glance than discrete whiskers. With a single seed (std=NaN
+    for each stage) the band collapses to zero width, same as the errorbar
+    plot showing no visible whisker in that case."""
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x = np.arange(len(stages))
+    colors = {"adam_only": "tab:blue", "adam_plus_bfgs": "tab:red"}
+    for label in ["adam_only", "adam_plus_bfgs"]:
+        sub = summary[summary["label"] == label].set_index("stage").reindex(stages)
+        mean = sub["rmse_mean"].to_numpy()
+        std = sub["rmse_std"].fillna(0.0).to_numpy()
+        lo = np.maximum(mean - std, mean * 1e-6)  # keep >0 for the log-scale axis below
+        ax.plot(x, mean, marker="o", color=colors[label], label=label)
+        ax.fill_between(x, lo, mean + std, color=colors[label], alpha=0.2)
+    baseline_vals = summary[summary["label"] == "adam_only"].set_index("stage").reindex(stages)["baseline_rmse_mean"]
+    ax.plot(x, baseline_vals, marker="*", color="green", linestyle="--", label="least-squares baseline")
+    ax.set_yscale("log")
+    ax.set_xticks(x); ax.set_xticklabels([s.split("_")[0].replace("stage", "S") for s in stages])
+    ax.set_xlabel("curriculum stage"); ax.set_ylabel("RMSE (log scale)")
+    ax.set_title(f"Precision across {len(stages)} stages: mean $\\pm$ std across seeds")
+    ax.legend()
+    plt.savefig(f"{out_dir}/full_sweep_summary_band.pdf", bbox_inches="tight", dpi=300)
+    plt.close(fig)
 
 
 def make_kink_plots(adam_curves, bfgs_curves, stages, out_dir, eval_every=EVAL_EVERY):
@@ -722,15 +754,15 @@ def make_residual_plots(refined_models, stages, out_dir):
         pred_np = pred[TARGET].numpy().astype(np.float64)
         truth_np = truth_t[TARGET].numpy().astype(np.float64)
         rel = (pred_np - truth_np) / np.where(truth_np != 0, truth_np, 1.0)
-        bias, resolution, n_kept = truncated_gaussian_resolution(rel)
+        bias, resolution = robust_bias(rel), robust_resolution(rel)
         lo, hi = np.percentile(rel, [0.5, 99.5])
         if lo == hi:
             lo, hi = -1e-3, 1e-3
         ax.hist(rel, bins=80, range=(lo, hi), density=True, alpha=0.7, color="tab:blue")
-        if resolution > 0:
-            xs = np.linspace(lo, hi, 200)
-            gaussian = (1 / (resolution * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((xs - bias) / resolution) ** 2)
-            ax.plot(xs, gaussian, color="red", linewidth=2)
+        half_iqr = resolution * 1.349 / 2
+        ax.axvline(bias, color="red", linewidth=1.5, label="median")
+        ax.axvline(bias - half_iqr, color="red", linewidth=1, linestyle="--", label="IQR/2")
+        ax.axvline(bias + half_iqr, color="red", linewidth=1, linestyle="--")
         ax.set_title(f"{stage.replace(chr(95),chr(32))}\nres={resolution*100:.3f}%  bias={bias*100:.3f}%", fontsize=8)
         ax.set_xlabel("(pred - truth) / truth", fontsize=8)
     plt.tight_layout()
